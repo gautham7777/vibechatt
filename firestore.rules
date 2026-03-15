@@ -104,5 +104,10 @@ service cloud.firestore {
                        get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId == request.auth.uid);
       }
     }
+
+    match /users/{userId} {
+      allow read: if isAuthenticated() && isOwner(userId);
+      allow create, update: if isAuthenticated() && isOwner(userId) && hasOnlyAllowedFields(['uid', 'displayName', 'photoURL', 'email', 'lastLoginAt']);
+    }
   }
 }

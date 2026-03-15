@@ -47,6 +47,26 @@
         }
       },
       "required": ["text", "senderId", "senderName", "senderPhoto", "createdAt"]
+    },
+    "Participant": {
+      "title": "Participant",
+      "description": "A user currently active in a chat room.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "The UID of the participant."
+        },
+        "name": {
+          "type": "string",
+          "description": "The display name of the participant."
+        },
+        "photo": {
+          "type": "string",
+          "description": "The profile photo URL of the participant."
+        }
+      },
+      "required": ["uid", "name", "photo"]
     }
   },
   "firestore": {
@@ -61,6 +81,12 @@
         "$ref": "#/entities/Message"
       },
       "description": "Subcollection of messages within a specific chat room."
+    },
+    "rooms/{roomId}/participants/{participantId}": {
+      "schema": {
+        "$ref": "#/entities/Participant"
+      },
+      "description": "Subcollection of active participants within a specific chat room."
     }
   }
 }
