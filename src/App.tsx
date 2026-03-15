@@ -5,7 +5,7 @@ import Home from './components/Home';
 import ChatRoom from './components/ChatRoom';
 import ProfileModal from './components/ProfileModal';
 import { motion, AnimatePresence } from 'motion/react';
-import { Loader2, MessageSquare, LogOut, Users, Settings } from 'lucide-react';
+import { Loader2, MessageSquare, LogOut, Users, Settings, Sun, Moon } from 'lucide-react';
 import { doc, setDoc } from 'firebase/firestore';
 import { db } from './firebase';
 
@@ -14,6 +14,14 @@ export default function App() {
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => (localStorage.getItem('theme') as 'light' | 'dark') || 'light');
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    localStorage.setItem('theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
 
   // Email/Password Auth State
   const [isLogin, setIsLogin] = useState(true);
@@ -66,7 +74,17 @@ export default function App() {
       }
     } catch (error: any) {
       console.error('Auth error:', error);
-      setAuthError(error.message || 'Authentication failed. Please try again.');
+      let message = 'Authentication failed. Please try again.';
+      if (error.code === 'auth/wrong-password') {
+        message = 'Incorrect password.';
+      } else if (error.code === 'auth/user-not-found') {
+        message = 'No account found with this email.';
+      } else if (error.code === 'auth/email-already-in-use') {
+        message = 'Email is already in use.';
+      } else if (error.code === 'auth/network-request-failed') {
+        message = 'Network error. Please check your connection.';
+      }
+      setAuthError(message);
     } finally {
       setIsAuthenticating(false);
     }
@@ -91,6 +109,12 @@ export default function App() {
         </div>
         {user ? (
           <div className="flex items-center gap-4 sm:gap-8">
+            <button 
+              onClick={toggleTheme}
+              className="p-2 rounded-full bg-white border border-slate-200 shadow-sm hover:border-brand-accent/30 transition-all text-slate-500 hover:text-brand-accent"
+            >
+              {theme === 'light' ? <Moon className="w-5 h-5" /> : <Sun className="w-5 h-5" />}
+            </button>
             <button 
               onClick={() => setIsProfileModalOpen(true)}
               className="hidden sm:flex items-center gap-3 px-4 py-2 rounded-full bg-white border border-slate-200 shadow-sm hover:border-brand-accent/30 hover:shadow-md transition-all cursor-pointer group"

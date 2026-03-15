@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import axios from 'axios';
 import { User } from 'firebase/auth';
 import { 
   collection, 
@@ -15,6 +16,7 @@ import {
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { db, storage } from '../firebase';
+import { sanitizeText } from '../utils/profanityFilter';
 import { motion, AnimatePresence } from 'motion/react';
 import { Loader2, Hash, Trash2, LogOut, MessageSquareDashed, Send, AlertTriangle, Copy, Check, Users, Smile, Paperclip, FileText, Image as ImageIcon, X } from 'lucide-react';
 import EmojiPicker from 'emoji-picker-react';
@@ -35,6 +37,17 @@ interface Message {
   fileUrl?: string;
   fileName?: string;
   fileType?: string;
+  isEdited?: boolean;
+  reactions?: { [emoji: string]: string[] };
+  replyTo?: string;
+  isSystem?: boolean;
+  type?: 'join' | 'leave' | 'kick';
+  urlPreview?: {
+    title: string;
+    description: string;
+    image: string;
+  };
+  readBy?: string[];
 }
 
 interface RoomData {
@@ -47,24 +60,76 @@ interface Participant {
   name: string;
   photo: string;
   isTyping?: boolean;
+  isMuted?: boolean;
 }
 
 export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
+  const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [roomData, setRoomData] = useState<RoomData | null>(null);
   const [isClosing, setIsClosing] = useState(false);
   const [copied, setCopied] = useState(false);
   const [messageToDelete, setMessageToDelete] = useState<string | null>(null);
   const [activeUsers, setActiveUsers] = useState<Participant[]>([]);
+  const activeUsersRef = useRef<Participant[]>([]);
+
+  useEffect(() => {
+    activeUsersRef.current = activeUsers;
+  }, [activeUsers]);
+
   const [error, setError] = useState<string | null>(null);
   const [isTypingLocal, setIsTypingLocal] = useState(false);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [urlPreview, setUrlPreview] = useState<any>(null);
+  const [isFetchingPreview, setIsFetchingPreview] = useState(false);
   const [attachment, setAttachment] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const unreadMessages = messages.filter(m => m.senderId !== user.uid && !m.readBy?.includes(user.uid));
+    unreadMessages.forEach(async (msg) => {
+      const messageRef = doc(db, 'rooms', roomId, 'messages', msg.id);
+      await setDoc(messageRef, { readBy: [...(msg.readBy || []), user.uid] }, { merge: true });
+    });
+  }, [messages, roomId, user.uid]);
+
+  const toggleMute = async (participant: Participant) => {
+    if (!roomData || roomData.ownerId !== user.uid) return;
+    const participantRef = doc(db, 'rooms', roomId, 'participants', participant.uid);
+    await setDoc(participantRef, { isMuted: !participant.isMuted }, { merge: true });
+  };
+
+  const editMessage = async (messageId: string, newText: string) => {
+    const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
+    await setDoc(messageRef, { text: newText, isEdited: true }, { merge: true });
+  };
+
+  const deleteMessage = async (messageId: string) => {
+    const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
+    await deleteDoc(messageRef);
+  };
+
+  const toggleReaction = async (messageId: string, emoji: string) => {
+    const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
+    const message = messages.find(m => m.id === messageId);
+    if (!message) return;
+
+    const reactions = message.reactions || {};
+    const users = reactions[emoji] || [];
+    
+    if (users.includes(user.uid)) {
+      reactions[emoji] = users.filter(uid => uid !== user.uid);
+      if (reactions[emoji].length === 0) delete reactions[emoji];
+    } else {
+      reactions[emoji] = [...users, user.uid];
+    }
+    
+    await setDoc(messageRef, { reactions }, { merge: true });
+  };
 
   const formatMessage = (text: string) => {
     const parts = text.split(/(\*.*?\*|_.*?_|~~.*?~~)/g);
@@ -85,13 +150,18 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
   useEffect(() => {
     // Fetch room data
     const fetchRoom = async () => {
-      const roomRef = doc(db, 'rooms', roomId);
-      const roomSnap = await getDoc(roomRef);
-      if (roomSnap.exists()) {
-        setRoomData(roomSnap.data() as RoomData);
-      } else {
-        // Room was deleted or doesn't exist
-        onLeave();
+      try {
+        const roomRef = doc(db, 'rooms', roomId);
+        const roomSnap = await getDoc(roomRef);
+        if (roomSnap.exists()) {
+          setRoomData(roomSnap.data() as RoomData);
+        } else {
+          // Room was deleted or doesn't exist
+          onLeave();
+        }
+      } catch (error) {
+        console.error('Firestore Error (fetchRoom):', error);
+        setError('Failed to load room. Please check your permissions.');
       }
     };
     fetchRoom();
@@ -101,7 +171,19 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
       if (!doc.exists()) {
         onLeave();
       }
+    }, (error) => {
+      console.error('Firestore Error (room):', error);
+      setError('Failed to load room. Please check your permissions.');
     });
+
+    if (!user) {
+      console.log('ChatRoom: User not authenticated, skipping listeners');
+      return () => {
+        unsubscribeRoom();
+      };
+    }
+
+    console.log('ChatRoom: Setting up listeners for roomId:', roomId, 'user:', user.uid);
 
     // Listen to messages
     const q = query(
@@ -118,14 +200,20 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
       setTimeout(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }, 100);
+    }, (error) => {
+      console.error('Firestore Error (messages) for roomId:', roomId, 'error:', error);
+      setError('Failed to load messages. Please check your permissions.');
     });
 
-    const unsubscribeParticipants = onSnapshot(collection(db, 'rooms', roomId, 'participants'), (snapshot) => {
+    const unsubscribeParticipants = onSnapshot(collection(db, 'rooms', roomId, 'allParticipants'), (snapshot) => {
       const users: Participant[] = [];
       snapshot.forEach((doc) => {
-        users.push(doc.data() as Participant);
+        users.push({ uid: doc.id, ...doc.data() } as Participant);
       });
       setActiveUsers(users);
+    }, (error) => {
+      console.error('Firestore Error (allParticipants):', error);
+      setError('Failed to load participants.');
     });
 
     return () => {
@@ -133,25 +221,27 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
       unsubscribeMessages();
       unsubscribeParticipants();
     };
-  }, [roomId, onLeave]);
+  }, [roomId, onLeave, user]);
 
   // Separate effect for participant tracking to update when profile changes
   useEffect(() => {
-    const participantRef = doc(db, 'rooms', roomId, 'participants', user.uid);
-    setDoc(participantRef, {
+    // Join room (persistent)
+    const allParticipantRef = doc(db, 'rooms', roomId, 'allParticipants', user.uid);
+    setDoc(allParticipantRef, {
       uid: user.uid,
       name: user.displayName || 'Anonymous',
       photo: user.photoURL || '',
-      isTyping: false
+      status: 'online',
+      lastSeen: serverTimestamp(),
     }, { merge: true });
 
     const handleBeforeUnload = () => {
-      deleteDoc(participantRef);
+      setDoc(allParticipantRef, { status: 'offline', lastSeen: serverTimestamp() }, { merge: true });
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
-      deleteDoc(participantRef);
+      setDoc(allParticipantRef, { status: 'offline', lastSeen: serverTimestamp() }, { merge: true });
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, [roomId, user.uid, user.displayName, user.photoURL]);
@@ -180,7 +270,7 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
     e.preventDefault();
     if ((!newMessage.trim() && !attachment) || newMessage.length > 1000 || isUploading) return;
 
-    const text = newMessage.trim();
+    const text = sanitizeText(newMessage.trim());
     setNewMessage('');
     setIsUploading(true);
     setError(null);
@@ -211,7 +301,9 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
         senderName: user.displayName || 'Anonymous',
         senderPhoto: user.photoURL || '',
         createdAt: serverTimestamp(),
-        ...(fileUrl && { fileUrl, fileName, fileType })
+        readBy: [user.uid],
+        ...(fileUrl && { fileUrl, fileName, fileType }),
+        replyTo: replyTo?.id || null,
       });
     } catch (err) {
       console.error('Error sending message:', err);
@@ -298,6 +390,8 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
 
   const isOwner = roomData.ownerId === user.uid;
   const typingUsers = activeUsers.filter(p => p.isTyping && p.uid !== user.uid);
+  const mutedUserIds = new Set(activeUsers.filter(p => p.isMuted).map(p => p.uid));
+  const filteredMessages = messages.filter(msg => !mutedUserIds.has(msg.senderId));
 
   const formatTime = (timestamp: any) => {
     if (!timestamp) return '';
@@ -329,54 +423,85 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
           {/* Active Users */}
           <div className="hidden sm:flex items-center gap-2 text-xs font-medium text-slate-500 bg-white px-3 py-1.5 rounded-full border border-slate-200 shadow-sm">
             <Users className="w-3.5 h-3.5 text-brand-accent" />
-            <span>{activeUsers.length} online</span>
+            <span>{activeUsers.filter(p => p.status === 'online').length} online</span>
             <div className="flex -space-x-2 ml-1">
-              {activeUsers.slice(0, 3).map(p => (
-                p.photo ? 
-                  <img key={p.uid} src={p.photo} className="w-6 h-6 rounded-full border-2 border-white object-cover" title={p.name} referrerPolicy="no-referrer" /> :
-                  <div key={p.uid} className="w-6 h-6 rounded-full bg-gradient-to-br from-brand-accent to-indigo-500 border-2 border-white flex items-center justify-center text-[9px] text-white font-bold" title={p.name}>
-                    {p.name.charAt(0).toUpperCase()}
+              {activeUsers.map(p => (
+                <div key={p.uid} className="relative group">
+                  <div className={`relative ${p.status === 'offline' ? 'opacity-50 grayscale' : ''}`}>
+                    {p.photo ? 
+                      <img src={p.photo} className="w-6 h-6 rounded-full border-2 border-white object-cover" title={p.name} referrerPolicy="no-referrer" /> :
+                      <div className="w-6 h-6 rounded-full bg-gradient-to-br from-brand-accent to-indigo-500 border-2 border-white flex items-center justify-center text-[9px] text-white font-bold" title={p.name}>
+                        {p.name.charAt(0).toUpperCase()}
+                      </div>
+                    }
+                    <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-white ${p.status === 'online' ? 'bg-green-500' : 'bg-slate-400'}`} />
                   </div>
-              ))}
-              {activeUsers.length > 3 && (
-                <div className="w-6 h-6 rounded-full bg-slate-100 border-2 border-white flex items-center justify-center text-[9px] text-slate-600 font-bold z-10">
-                  +{activeUsers.length - 3}
+                  {isOwner && p.uid !== user.uid && (
+                    <button 
+                      onClick={() => {
+                        if (confirm(`Kick ${p.name}?`)) {
+                          deleteDoc(doc(db, 'rooms', roomId, 'participants', p.uid));
+                        }
+                      }}
+                      className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white flex items-center justify-center text-[8px] opacity-0 group-hover:opacity-100 transition-opacity"
+                      title="Kick user"
+                    >
+                      X
+                    </button>
+                  )}
                 </div>
-              )}
+              ))}
             </div>
           </div>
         </div>
         
         <div className="flex items-center gap-3">
-          {isOwner ? (
+          <div className="flex items-center gap-2">
             <button
-              onClick={handleCloseRoom}
-              className="px-4 sm:px-5 py-2 sm:py-2.5 rounded-xl bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-all text-sm font-bold flex items-center gap-2"
+              onClick={() => {
+                const chatLog = messages.map(m => `[${new Date(m.createdAt?.seconds * 1000).toLocaleTimeString()}] ${m.senderName}: ${m.text}`).join('\n');
+                const blob = new Blob([chatLog], { type: 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `chat_${roomId}.txt`;
+                a.click();
+              }}
+              className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 transition-all"
+              title="Export Chat"
             >
-              <Trash2 className="w-4 h-4" /> <span className="hidden sm:inline">Close Room</span>
+              <FileText className="w-4 h-4" />
             </button>
-          ) : (
-            <button
-              onClick={onLeave}
-              className="px-4 sm:px-5 py-2 sm:py-2.5 rounded-xl bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 transition-all text-sm font-bold flex items-center gap-2"
-            >
-              <LogOut className="w-4 h-4" /> <span className="hidden sm:inline">Leave</span>
-            </button>
-          )}
+            {isOwner ? (
+              <button
+                onClick={handleCloseRoom}
+                className="px-4 sm:px-5 py-2 sm:py-2.5 rounded-xl bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-all text-sm font-bold flex items-center gap-2"
+              >
+                <Trash2 className="w-4 h-4" /> <span className="hidden sm:inline">Close Room</span>
+              </button>
+            ) : (
+              <button
+                onClick={onLeave}
+                className="px-4 sm:px-5 py-2 sm:py-2.5 rounded-xl bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 transition-all text-sm font-bold flex items-center gap-2"
+              >
+                <LogOut className="w-4 h-4" /> <span className="hidden sm:inline">Leave</span>
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
       {/* Messages Area */}
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth z-10 bg-slate-50/50">
-        {messages.length === 0 ? (
+        {filteredMessages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
             <MessageSquareDashed className="w-16 h-16 mb-2 opacity-30" />
             <p className="font-medium text-lg">It's quiet here... send a message to start the conversation!</p>
           </div>
         ) : (
-          messages.map((msg, index) => {
+          filteredMessages.map((msg, index) => {
             const isMe = msg.senderId === user.uid;
-            const showHeader = index === 0 || messages[index - 1].senderId !== msg.senderId;
+            const showHeader = index === 0 || filteredMessages[index - 1].senderId !== msg.senderId;
 
             return (
               <motion.div 
@@ -400,12 +525,28 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
                 )}
                 <div className={`flex items-end gap-2 ${isMe ? 'flex-row-reverse' : 'flex-row'} max-w-[85%] sm:max-w-[75%]`}>
                   <div 
-                    className={`px-5 py-3.5 rounded-2xl text-sm sm:text-base shadow-md font-medium leading-relaxed ${
+                    className={`px-5 py-3.5 rounded-2xl text-sm sm:text-base shadow-md font-medium leading-relaxed group relative ${
                       isMe 
                         ? 'bg-gradient-to-br from-brand-accent to-indigo-500 text-white rounded-tr-sm' 
                         : 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm'
                     }`}
                   >
+                    {/* Message Actions */}
+                    <div className={`absolute -top-10 ${isMe ? 'left-0' : 'right-0'} opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 bg-white p-1 rounded-full shadow-lg border border-slate-100`}>
+                      {isMe && (
+                        <>
+                          <button onClick={() => { const newText = prompt('Edit message:', msg.text); if (newText) editMessage(msg.id, newText); }} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-brand-accent">
+                            <FileText className="w-4 h-4" />
+                          </button>
+                          <button onClick={() => deleteMessage(msg.id)} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-red-500">
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </>
+                      )}
+                      <button onClick={() => toggleReaction(msg.id, '👍')} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-brand-accent">👍</button>
+                      <button onClick={() => toggleReaction(msg.id, '❤️')} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-red-500">❤️</button>
+                    </div>
+
                     {msg.fileUrl && (
                       <div className={`mb-2 rounded-xl overflow-hidden border ${isMe ? 'border-white/20' : 'border-slate-200'}`}>
                         {msg.fileType?.startsWith('image/') ? (
@@ -430,9 +571,24 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
                         )}
                       </div>
                     )}
-                    {msg.text && <div className="break-words">{formatMessage(msg.text)}</div>}
-                    <div className={`text-[10px] mt-1 text-right ${isMe ? 'text-blue-200' : 'text-slate-400'}`}>
+                    {msg.text && <div className="break-words">{formatMessage(msg.text)} {msg.isEdited && <span className="text-[10px] opacity-70">(edited)</span>}</div>}
+                    
+                    {/* Reactions */}
+                    {msg.reactions && Object.keys(msg.reactions).length > 0 && (
+                      <div className="flex gap-1 mt-2">
+                        {Object.entries(msg.reactions).map(([emoji, users]) => (
+                          <div key={emoji} className="bg-white/20 rounded-full px-2 py-0.5 text-xs flex items-center gap-1">
+                            {emoji} {(users as string[]).length}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    
+                    <div className={`text-[10px] mt-1 text-right flex items-center justify-end gap-1 ${isMe ? 'text-blue-200' : 'text-slate-400'}`}>
                       {formatTime(msg.createdAt)}
+                      {isMe && (
+                        <Check className={`w-3 h-3 ${msg.readBy && msg.readBy.length > 1 ? 'text-emerald-300' : 'text-slate-300'}`} />
+                      )}
                     </div>
                   </div>
                   

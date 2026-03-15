@@ -35,6 +35,10 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
     function hasOnlyAllowedFields(fields) {
       return request.resource.data.keys().hasOnly(fields);
     }
@@ -49,19 +53,38 @@ service cloud.firestore {
     // Domain Validators
     // ===============================================================
     function isValidRoom() {
-      return hasOnlyAllowedFields(['code', 'ownerId', 'createdAt']) &&
+      return hasRequiredFields(['code', 'ownerId', 'createdAt']) &&
+             hasOnlyAllowedFields(['code', 'ownerId', 'createdAt']) &&
              validStringLength('code', 1, 50) &&
              request.resource.data.ownerId is string &&
              request.resource.data.createdAt is timestamp;
     }
 
     function isValidMessage() {
-      return hasOnlyAllowedFields(['text', 'senderId', 'senderName', 'senderPhoto', 'createdAt']) &&
-             validStringLength('text', 1, 1000) &&
+      return hasRequiredFields(['text', 'senderId', 'senderName', 'senderPhoto', 'createdAt', 'readBy']) &&
+             hasOnlyAllowedFields(['text', 'senderId', 'senderName', 'senderPhoto', 'createdAt', 'readBy', 'fileUrl', 'fileName', 'fileType', 'replyTo']) &&
+             validStringLength('text', 0, 1000) &&
              request.resource.data.senderId is string &&
              validStringLength('senderName', 1, 100) &&
              validStringLength('senderPhoto', 0, 500) &&
-             request.resource.data.createdAt is timestamp;
+             request.resource.data.createdAt is timestamp &&
+             request.resource.data.readBy is list &&
+             (!('fileUrl' in request.resource.data) || validStringLength('fileUrl', 1, 500)) &&
+             (!('fileName' in request.resource.data) || validStringLength('fileName', 1, 100)) &&
+             (!('fileType' in request.resource.data) || validStringLength('fileType', 1, 100)) &&
+             (!('replyTo' in request.resource.data) || request.resource.data.replyTo is string || request.resource.data.replyTo == null);
+    }
+
+    function isValidParticipant() {
+      return hasRequiredFields(['uid', 'name', 'photo', 'status', 'lastSeen']) &&
+             hasOnlyAllowedFields(['uid', 'name', 'photo', 'status', 'lastSeen', 'isTyping', 'isMuted']) &&
+             request.resource.data.uid is string &&
+             validStringLength('name', 1, 100) &&
+             validStringLength('photo', 0, 500) &&
+             request.resource.data.status is string &&
+             request.resource.data.lastSeen is timestamp &&
+             (!('isTyping' in request.resource.data) || request.resource.data.isTyping is bool) &&
+             (!('isMuted' in request.resource.data) || request.resource.data.isMuted is bool);
     }
 
     // ===============================================================
@@ -95,13 +118,39 @@ service cloud.firestore {
                       isValidMessage() && 
                       request.resource.data.senderId == request.auth.uid;
         
-        // No updates allowed for messages
-        allow update: if false;
+        // Sender can update or delete their own message
+        allow update: if isAuthenticated() && 
+                      resource.data.senderId == request.auth.uid &&
+                      isValidMessage() &&
+                      request.resource.data.senderId == resource.data.senderId &&
+                      request.resource.data.createdAt == resource.data.createdAt;
         
         // Only the sender or the room owner can delete a message
         allow delete: if isAuthenticated() && 
                       (resource.data.senderId == request.auth.uid || 
                        get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId == request.auth.uid);
+      }
+
+      match /allParticipants/{participantId} {
+        // Anyone authenticated can read participants
+        allow read: if isAuthenticated();
+        
+        // Users can create/update their own participant document
+        allow create, update: if isAuthenticated() && isOwner(participantId) && isValidParticipant();
+        
+        // Users can delete their own participant document
+        allow delete: if isAuthenticated() && isOwner(participantId);
+      }
+
+      match /participants/{participantId} {
+        // Anyone authenticated can read participants
+        allow read: if isAuthenticated();
+        
+        // Users can create/update their own participant document
+        allow create, update: if isAuthenticated() && isOwner(participantId) && hasOnlyAllowedFields(['isTyping', 'isMuted']);
+        
+        // Users can delete their own participant document
+        allow delete: if isAuthenticated() && isOwner(participantId);
       }
     }
 
