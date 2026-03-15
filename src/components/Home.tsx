@@ -1,10 +1,10 @@
+// Main Home Component for VIBECHAT
 import React, { useState } from 'react';
 import { User } from 'firebase/auth';
 import { collection, addDoc, serverTimestamp, query, where, getDocs } from 'firebase/firestore';
 import { db } from '../firebase';
 import { motion } from 'motion/react';
 import { Plus, LogIn, Loader2 } from 'lucide-react';
-import { handleFirestoreError, OperationType } from '../utils/errorHandling';
 
 interface HomeProps {
   user: User;
@@ -33,8 +33,8 @@ export default function Home({ user, onJoinRoom }: HomeProps) {
       });
       onJoinRoom(docRef.id);
     } catch (err) {
+      console.error(err);
       setError('Failed to create room. Please try again.');
-      handleFirestoreError(err, OperationType.CREATE, 'rooms');
     } finally {
       setIsCreating(false);
     }
@@ -56,8 +56,8 @@ export default function Home({ user, onJoinRoom }: HomeProps) {
         onJoinRoom(querySnapshot.docs[0].id);
       }
     } catch (err) {
+      console.error(err);
       setError('Failed to join room. Please try again.');
-      handleFirestoreError(err, OperationType.GET, 'rooms');
     } finally {
       setIsJoining(false);
     }
