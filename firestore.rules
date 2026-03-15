@@ -1,0 +1,108 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: rooms
+    // Document ID: auto-generated
+    // Fields:
+    //   - code: string (required, length > 0) - The unique code used to join the room.
+    //   - ownerId: string (required) - The UID of the user who created the room.
+    //   - createdAt: timestamp (required) - When the room was created.
+    //
+    // Collection: rooms/{roomId}/messages
+    // Document ID: auto-generated
+    // Fields:
+    //   - text: string (required, length > 0, length < 1000) - The content of the message.
+    //   - senderId: string (required) - The UID of the user who sent the message.
+    //   - senderName: string (required, length < 100) - The display name of the sender.
+    //   - senderPhoto: string (required, length < 500) - The profile photo URL of the sender.
+    //   - createdAt: timestamp (required) - When the message was sent.
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidRoom() {
+      return hasOnlyAllowedFields(['code', 'ownerId', 'createdAt']) &&
+             validStringLength('code', 1, 50) &&
+             request.resource.data.ownerId is string &&
+             request.resource.data.createdAt is timestamp;
+    }
+
+    function isValidMessage() {
+      return hasOnlyAllowedFields(['text', 'senderId', 'senderName', 'senderPhoto', 'createdAt']) &&
+             validStringLength('text', 1, 1000) &&
+             request.resource.data.senderId is string &&
+             validStringLength('senderName', 1, 100) &&
+             validStringLength('senderPhoto', 0, 500) &&
+             request.resource.data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /rooms/{roomId} {
+      // Anyone authenticated can read a room (to check if code exists)
+      allow read: if isAuthenticated();
+      
+      // Anyone authenticated can create a room, but they must be the owner
+      allow create: if isAuthenticated() && 
+                    isValidRoom() && 
+                    request.resource.data.ownerId == request.auth.uid;
+      
+      // Only the owner can update or delete the room
+      allow update: if isAuthenticated() && 
+                    resource.data.ownerId == request.auth.uid &&
+                    isValidRoom() &&
+                    request.resource.data.ownerId == resource.data.ownerId &&
+                    request.resource.data.createdAt == resource.data.createdAt;
+                    
+      allow delete: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+
+      match /messages/{messageId} {
+        // Anyone authenticated can read messages in a room
+        allow read: if isAuthenticated();
+        
+        // Anyone authenticated can create a message, but senderId must be their own
+        allow create: if isAuthenticated() && 
+                      isValidMessage() && 
+                      request.resource.data.senderId == request.auth.uid;
+        
+        // No updates allowed for messages
+        allow update: if false;
+        
+        // Only the sender or the room owner can delete a message
+        allow delete: if isAuthenticated() && 
+                      (resource.data.senderId == request.auth.uid || 
+                       get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId == request.auth.uid);
+      }
+    }
+  }
+}

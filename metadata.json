@@ -1,0 +1,5 @@
+{
+  "name": "VibeChat",
+  "description": "A colorful, real-time chat app using Firebase where rooms are created with codes and permanently deleted when closed.",
+  "requestFramePermissions": []
+}

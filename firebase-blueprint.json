@@ -1,0 +1,66 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "A chat room created by a user with a specific code.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "The unique code used to join the room."
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "The UID of the user who created the room."
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "When the room was created."
+        }
+      },
+      "required": ["code", "ownerId", "createdAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A message sent within a chat room.",
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The content of the message."
+        },
+        "senderId": {
+          "type": "string",
+          "description": "The UID of the user who sent the message."
+        },
+        "senderName": {
+          "type": "string",
+          "description": "The display name of the sender."
+        },
+        "senderPhoto": {
+          "type": "string",
+          "description": "The profile photo URL of the sender."
+        },
+        "createdAt": {
+          "type": "timestamp",
+          "description": "When the message was sent."
+        }
+      },
+      "required": ["text", "senderId", "senderName", "senderPhoto", "createdAt"]
+    }
+  },
+  "firestore": {
+    "rooms/{roomId}": {
+      "schema": {
+        "$ref": "#/entities/Room"
+      },
+      "description": "Collection of all chat rooms."
+    },
+    "rooms/{roomId}/messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/Message"
+      },
+      "description": "Subcollection of messages within a specific chat room."
+    }
+  }
+}
