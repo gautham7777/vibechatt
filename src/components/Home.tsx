@@ -3,6 +3,7 @@ import React, { useState } from 'react';
 import { User } from 'firebase/auth';
 import { collection, addDoc, serverTimestamp, query, where, getDocs } from 'firebase/firestore';
 import { db } from '../firebase';
+import { handleFirestoreError, OperationType } from '../utils/errorHandling';
 import { motion } from 'motion/react';
 import { Plus, LogIn, Loader2 } from 'lucide-react';
 
@@ -33,7 +34,7 @@ export default function Home({ user, onJoinRoom }: HomeProps) {
       });
       onJoinRoom(docRef.id);
     } catch (err) {
-      console.error(err);
+      handleFirestoreError(err, OperationType.CREATE, 'rooms');
       setError('Failed to create room. Please try again.');
     } finally {
       setIsCreating(false);
@@ -56,7 +57,7 @@ export default function Home({ user, onJoinRoom }: HomeProps) {
         onJoinRoom(querySnapshot.docs[0].id);
       }
     } catch (err) {
-      console.error(err);
+      handleFirestoreError(err, OperationType.LIST, 'rooms');
       setError('Failed to join room. Please try again.');
     } finally {
       setIsJoining(false);

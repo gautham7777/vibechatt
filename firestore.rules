@@ -35,6 +35,12 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "gcsnair123456789@gmail.com" && request.auth.token.email_verified == true)); // Default admin
+    }
+
     function hasRequiredFields(fields) {
       return request.resource.data.keys().hasAll(fields);
     }
@@ -62,7 +68,7 @@ service cloud.firestore {
 
     function isValidMessage() {
       return hasRequiredFields(['text', 'senderId', 'senderName', 'senderPhoto', 'createdAt', 'readBy']) &&
-             hasOnlyAllowedFields(['text', 'senderId', 'senderName', 'senderPhoto', 'createdAt', 'readBy', 'fileUrl', 'fileName', 'fileType', 'replyTo']) &&
+             hasOnlyAllowedFields(['text', 'senderId', 'senderName', 'senderPhoto', 'createdAt', 'readBy', 'fileUrl', 'fileName', 'fileType', 'replyTo', 'reactions', 'isEdited', 'isOneTime', 'viewedBy']) &&
              validStringLength('text', 0, 1000) &&
              request.resource.data.senderId is string &&
              validStringLength('senderName', 1, 100) &&
@@ -72,7 +78,11 @@ service cloud.firestore {
              (!('fileUrl' in request.resource.data) || validStringLength('fileUrl', 1, 500)) &&
              (!('fileName' in request.resource.data) || validStringLength('fileName', 1, 100)) &&
              (!('fileType' in request.resource.data) || validStringLength('fileType', 1, 100)) &&
-             (!('replyTo' in request.resource.data) || request.resource.data.replyTo is string || request.resource.data.replyTo == null);
+             (!('replyTo' in request.resource.data) || request.resource.data.replyTo is string || request.resource.data.replyTo == null) &&
+             (!('reactions' in request.resource.data) || request.resource.data.reactions is map) &&
+             (!('isEdited' in request.resource.data) || request.resource.data.isEdited is bool) &&
+             (!('isOneTime' in request.resource.data) || request.resource.data.isOneTime is bool) &&
+             (!('viewedBy' in request.resource.data) || request.resource.data.viewedBy is list);
     }
 
     function isValidParticipant() {
@@ -118,12 +128,15 @@ service cloud.firestore {
                       isValidMessage() && 
                       request.resource.data.senderId == request.auth.uid;
         
-        // Sender can update or delete their own message
-        allow update: if isAuthenticated() && 
-                      resource.data.senderId == request.auth.uid &&
-                      isValidMessage() &&
-                      request.resource.data.senderId == resource.data.senderId &&
-                      request.resource.data.createdAt == resource.data.createdAt;
+        // Sender can update their own message, or anyone can update reactions/readBy
+        allow update: if isAuthenticated() && isValidMessage() && (
+          // Case 1: Sender updating their own message
+          (resource.data.senderId == request.auth.uid && 
+           request.resource.data.senderId == resource.data.senderId &&
+           request.resource.data.createdAt == resource.data.createdAt) ||
+          // Case 2: Anyone updating reactions or readBy
+          (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions', 'readBy', 'viewedBy']))
+        );
         
         // Only the sender or the room owner can delete a message
         allow delete: if isAuthenticated() && 
@@ -151,6 +164,14 @@ service cloud.firestore {
         
         // Users can delete their own participant document
         allow delete: if isAuthenticated() && isOwner(participantId);
+      }
+
+      match /call/{callId} {
+        allow read, write: if isAuthenticated();
+
+        match /{subcollection=**} {
+           allow read, write: if isAuthenticated();
+        }
       }
     }
 

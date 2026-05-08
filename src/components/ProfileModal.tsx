@@ -3,6 +3,7 @@ import { User, updateProfile } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { db, storage } from '../firebase';
+import { handleFirestoreError, OperationType } from '../utils/errorHandling';
 import { motion, AnimatePresence } from 'motion/react';
 import { X, Loader2, User as UserIcon, Camera, Upload } from 'lucide-react';
 
@@ -120,7 +121,7 @@ export default function ProfileModal({ user, isOpen, onClose, onUpdate }: Profil
       onUpdate({ ...user, displayName: name.trim(), photoURL: finalPhotoUrl || null } as User);
       onClose();
     } catch (err: any) {
-      console.error('Error updating profile:', err);
+      handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
       setError(err.message || 'Failed to update profile.');
     } finally {
       setIsUpdating(false);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Component } from 'react';
 import axios from 'axios';
 import { User } from 'firebase/auth';
 import { 
@@ -15,11 +15,46 @@ import {
   setDoc
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { db, storage } from '../firebase';
+import { db, storage, auth } from '../firebase';
 import { sanitizeText } from '../utils/profanityFilter';
+import { handleFirestoreError, OperationType } from '../utils/errorHandling';
 import { motion, AnimatePresence } from 'motion/react';
-import { Loader2, Hash, Trash2, LogOut, MessageSquareDashed, Send, AlertTriangle, Copy, Check, Users, Smile, Paperclip, FileText, Image as ImageIcon, X } from 'lucide-react';
+import { Loader2, Hash, Trash2, LogOut, MessageSquareDashed, Send, AlertTriangle, Copy, Check, Users, Smile, Paperclip, FileText, Image as ImageIcon, X, RefreshCw, Pencil, Eye, EyeOff, Lock, Video } from 'lucide-react';
 import EmojiPicker from 'emoji-picker-react';
+import DecryptedMedia from './DecryptedMedia';
+import VideoCallModal from './VideoCallModal';
+import { encryptText, decryptText, encryptFile, setRoomKey, getRoomKey } from '../utils/encryption';
+
+class ErrorBoundary extends Component<any, any> {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex-1 flex items-center justify-center p-6 bg-slate-50">
+          <div className="max-w-md w-full bg-white p-8 rounded-2xl shadow-xl border border-red-100 text-center">
+            <div className="w-16 h-16 bg-red-50 rounded-2xl flex items-center justify-center mx-auto mb-6">
+              <AlertTriangle className="w-8 h-8 text-red-500" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900 mb-2">Something went wrong</h2>
+            <p className="text-slate-500 mb-6">We encountered an unexpected error. Don't worry, your data is safe.</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-3 bg-brand-accent text-white rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-600 transition-all"
+            >
+              <RefreshCw className="w-4 h-4" /> Reload Workspace
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return (this as any).props.children;
+  }
+}
 
 interface ChatRoomProps {
   user: User;
@@ -48,6 +83,8 @@ interface Message {
     image: string;
   };
   readBy?: string[];
+  isOneTime?: boolean;
+  viewedBy?: string[];
 }
 
 interface RoomData {
@@ -63,10 +100,20 @@ interface Participant {
   isMuted?: boolean;
 }
 
-export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
+export default function ChatRoomWrapper(props: ChatRoomProps) {
+  return (
+    <ErrorBoundary>
+      <ChatRoom {...props} />
+    </ErrorBoundary>
+  );
+}
+
+function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [replyTo, setReplyTo] = useState<Message | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
   const [roomData, setRoomData] = useState<RoomData | null>(null);
   const [isClosing, setIsClosing] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -85,6 +132,11 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
   const [isFetchingPreview, setIsFetchingPreview] = useState(false);
   const [attachment, setAttachment] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [isOneTime, setIsOneTime] = useState(false);
+  const [isKeyPromptOpen, setIsKeyPromptOpen] = useState(!getRoomKey());
+  const [e2eeKeyInput, setE2eeKeyInput] = useState('');
+  const [isVideoCallOpen, setIsVideoCallOpen] = useState(false);
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -93,42 +145,83 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
     const unreadMessages = messages.filter(m => m.senderId !== user.uid && !m.readBy?.includes(user.uid));
     unreadMessages.forEach(async (msg) => {
       const messageRef = doc(db, 'rooms', roomId, 'messages', msg.id);
-      await setDoc(messageRef, { readBy: [...(msg.readBy || []), user.uid] }, { merge: true });
+      try {
+        await setDoc(messageRef, { readBy: [...(msg.readBy || []), user.uid] }, { merge: true });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `rooms/${roomId}/messages/${msg.id}`);
+      }
     });
   }, [messages, roomId, user.uid]);
 
   const toggleMute = async (participant: Participant) => {
     if (!roomData || roomData.ownerId !== user.uid) return;
-    const participantRef = doc(db, 'rooms', roomId, 'participants', participant.uid);
-    await setDoc(participantRef, { isMuted: !participant.isMuted }, { merge: true });
+    const path = `rooms/${roomId}/participants/${participant.uid}`;
+    try {
+      const participantRef = doc(db, 'rooms', roomId, 'participants', participant.uid);
+      await setDoc(participantRef, { isMuted: !participant.isMuted }, { merge: true });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
   };
 
   const editMessage = async (messageId: string, newText: string) => {
-    const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
-    await setDoc(messageRef, { text: newText, isEdited: true }, { merge: true });
+    const path = `rooms/${roomId}/messages/${messageId}`;
+    try {
+      const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
+      await setDoc(messageRef, { text: newText, isEdited: true }, { merge: true });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  };
+
+  const startEditing = (message: Message) => {
+    setEditingMessageId(message.id);
+    setEditText(message.text);
+  };
+
+  const cancelEditing = () => {
+    setEditingMessageId(null);
+    setEditText('');
+  };
+
+  const handleUpdateMessage = async (messageId: string) => {
+    if (!editText.trim() || editText.length > 1000) return;
+    await editMessage(messageId, editText.trim());
+    setEditingMessageId(null);
+    setEditText('');
   };
 
   const deleteMessage = async (messageId: string) => {
-    const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
-    await deleteDoc(messageRef);
+    const path = `rooms/${roomId}/messages/${messageId}`;
+    try {
+      const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
+      await deleteDoc(messageRef);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
   };
 
   const toggleReaction = async (messageId: string, emoji: string) => {
-    const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
-    const message = messages.find(m => m.id === messageId);
-    if (!message) return;
+    const path = `rooms/${roomId}/messages/${messageId}`;
+    try {
+      const messageRef = doc(db, 'rooms', roomId, 'messages', messageId);
+      const message = messages.find(m => m.id === messageId);
+      if (!message) return;
 
-    const reactions = message.reactions || {};
-    const users = reactions[emoji] || [];
-    
-    if (users.includes(user.uid)) {
-      reactions[emoji] = users.filter(uid => uid !== user.uid);
-      if (reactions[emoji].length === 0) delete reactions[emoji];
-    } else {
-      reactions[emoji] = [...users, user.uid];
+      const reactions = message.reactions || {};
+      const users = reactions[emoji] || [];
+      
+      if (users.includes(user.uid)) {
+        reactions[emoji] = users.filter(uid => uid !== user.uid);
+        if (reactions[emoji].length === 0) delete reactions[emoji];
+      } else {
+        reactions[emoji] = [...users, user.uid];
+      }
+      
+      await setDoc(messageRef, { reactions }, { merge: true });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
     }
-    
-    await setDoc(messageRef, { reactions }, { merge: true });
   };
 
   const formatMessage = (text: string) => {
@@ -287,8 +380,20 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
       let fileType = null;
 
       if (attachment) {
-        const storageRef = ref(storage, `rooms/${roomId}/${Date.now()}_${attachment.name}`);
-        await uploadBytes(storageRef, attachment);
+        // Encrypt file as Blob before uploading
+        const reader = new FileReader();
+        const encryptedBlob = await new Promise<Blob>((resolve, reject) => {
+          reader.onload = (e) => {
+             const dataUrl = e.target?.result as string;
+             const cipherFile = encryptFile(dataUrl);
+             resolve(new Blob([cipherFile], { type: 'text/plain' }));
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(attachment);
+        });
+
+        const storageRef = ref(storage, `rooms/${roomId}/${Date.now()}_secure.enc`);
+        await uploadBytes(storageRef, encryptedBlob);
         fileUrl = await getDownloadURL(storageRef);
         fileName = attachment.name;
         fileType = attachment.type;
@@ -296,17 +401,19 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
       }
 
       await addDoc(collection(db, 'rooms', roomId, 'messages'), {
-        text,
+        text: encryptText(text),
         senderId: user.uid,
         senderName: user.displayName || 'Anonymous',
         senderPhoto: user.photoURL || '',
         createdAt: serverTimestamp(),
         readBy: [user.uid],
         ...(fileUrl && { fileUrl, fileName, fileType }),
+        ...(isOneTime && { isOneTime: true, viewedBy: [] }),
         replyTo: replyTo?.id || null,
       });
+      setIsOneTime(false);
     } catch (err) {
-      console.error('Error sending message:', err);
+      handleFirestoreError(err, OperationType.CREATE, `rooms/${roomId}/messages`);
       setError('Failed to send message. Please try again.');
       setNewMessage(text); // Restore text on failure
     } finally {
@@ -354,7 +461,7 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
       // 3. Leave the room (handled by onSnapshot listener usually, but just in case)
       onLeave();
     } catch (error) {
-      console.error('Error closing room:', error);
+      handleFirestoreError(error, OperationType.DELETE, `rooms/${roomId}`);
       setIsClosing(false);
     }
   };
@@ -401,6 +508,36 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
 
   return (
     <div className="flex-1 flex flex-col pro-card rounded-2xl overflow-hidden relative pro-shadow">
+      {/* E2EE Prompt Modal */}
+      <AnimatePresence>
+        {isKeyPromptOpen && (
+          <motion.div 
+             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+             className="absolute inset-0 bg-white/90 backdrop-blur-sm z-50 flex items-center justify-center p-6"
+          >
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-xl p-8 w-full max-w-md text-center">
+              <div className="w-16 h-16 bg-brand-accent/10 rounded-2xl flex items-center justify-center mx-auto mb-6 text-brand-accent">
+                <Lock className="w-8 h-8" />
+              </div>
+              <h2 className="text-2xl font-bold text-slate-900 mb-2">End-to-End Encryption</h2>
+              <p className="text-slate-500 mb-6 text-sm">Enter the Room Key to decrypt messages and files.</p>
+              <form onSubmit={(e) => { e.preventDefault(); setRoomKey(e2eeKeyInput); setIsKeyPromptOpen(false); }}>
+                <input 
+                  type="password"
+                  placeholder="Enter Room Key"
+                  value={e2eeKeyInput}
+                  onChange={(e) => setE2eeKeyInput(e.target.value)}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-accent/20 outline-none transition-all font-medium mb-4"
+                  required
+                />
+                <button type="submit" className="w-full py-3 bg-brand-accent text-white font-bold rounded-xl shadow-[0_8px_16px_rgba(37,99,235,0.2)] hover:-translate-y-0.5 transition-all">
+                  Unlock Workspace
+                </button>
+              </form>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       
       {/* Header */}
       <div className="flex items-center justify-between p-4 sm:p-6 border-b border-slate-200 bg-white z-10">
@@ -457,6 +594,13 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
         
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => setIsVideoCallOpen(true)}
+              className="p-2 px-3 rounded-xl bg-brand-accent/10 hover:bg-brand-accent/20 text-brand-accent transition-all flex items-center gap-2 text-sm font-bold shadow-sm"
+              title="Secure Video Call"
+            >
+              <Video className="w-4 h-4" /> <span className="hidden sm:inline">Join Call</span>
+            </button>
             <button
               onClick={() => {
                 const chatLog = messages.map(m => `[${new Date(m.createdAt?.seconds * 1000).toLocaleTimeString()}] ${m.senderName}: ${m.text}`).join('\n');
@@ -532,46 +676,64 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
                     }`}
                   >
                     {/* Message Actions */}
-                    <div className={`absolute -top-10 ${isMe ? 'left-0' : 'right-0'} opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 bg-white p-1 rounded-full shadow-lg border border-slate-100`}>
+                    <div className={`absolute -top-10 ${isMe ? 'left-0' : 'right-0'} opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 bg-white p-1 rounded-full shadow-lg border border-slate-100 z-20`}>
                       {isMe && (
                         <>
-                          <button onClick={() => { const newText = prompt('Edit message:', msg.text); if (newText) editMessage(msg.id, newText); }} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-brand-accent">
-                            <FileText className="w-4 h-4" />
+                          <button 
+                            onClick={() => startEditing(msg)} 
+                            className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-brand-accent transition-colors"
+                            title="Edit message"
+                          >
+                            <Pencil className="w-4 h-4" />
                           </button>
-                          <button onClick={() => deleteMessage(msg.id)} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-red-500">
+                          <button 
+                            onClick={() => setMessageToDelete(msg.id)} 
+                            className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-red-500 transition-colors"
+                            title="Delete message"
+                          >
                             <Trash2 className="w-4 h-4" />
                           </button>
                         </>
                       )}
-                      <button onClick={() => toggleReaction(msg.id, '👍')} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-brand-accent">👍</button>
-                      <button onClick={() => toggleReaction(msg.id, '❤️')} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-red-500">❤️</button>
+                      <button onClick={() => toggleReaction(msg.id, '👍')} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-brand-accent transition-colors">👍</button>
+                      <button onClick={() => toggleReaction(msg.id, '❤️')} className="p-1.5 rounded-full hover:bg-slate-100 text-slate-500 hover:text-red-500 transition-colors">❤️</button>
                     </div>
 
                     {msg.fileUrl && (
-                      <div className={`mb-2 rounded-xl overflow-hidden border ${isMe ? 'border-white/20' : 'border-slate-200'}`}>
-                        {msg.fileType?.startsWith('image/') ? (
-                          <a href={msg.fileUrl} target="_blank" rel="noopener noreferrer">
-                            <img src={msg.fileUrl} alt={msg.fileName} className="max-w-full h-auto max-h-64 object-contain bg-black/5" />
-                          </a>
-                        ) : (
-                          <a 
-                            href={msg.fileUrl} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className={`flex items-center gap-3 p-3 transition-colors ${isMe ? 'bg-black/10 hover:bg-black/20 text-white' : 'bg-slate-50 hover:bg-slate-100 text-slate-700'}`}
-                          >
-                            <div className={`p-2 rounded-lg ${isMe ? 'bg-white/20' : 'bg-white shadow-sm'}`}>
-                              <FileText className="w-5 h-5" />
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-bold truncate">{msg.fileName}</p>
-                              <p className={`text-[10px] uppercase tracking-wider ${isMe ? 'text-blue-100' : 'text-slate-500'}`}>Document</p>
-                            </div>
-                          </a>
-                        )}
+                      <div className={`mb-2 rounded-xl overflow-hidden ${!msg.isOneTime && 'border'} ${isMe ? 'border-white/20' : 'border-slate-200'}`}>
+                        <DecryptedMedia 
+                          fileUrl={msg.fileUrl}
+                          fileName={msg.fileName || 'Encrypted File'}
+                          fileType={msg.fileType || ''}
+                          isOneTime={msg.isOneTime}
+                          viewedBy={msg.viewedBy || []}
+                          messageId={msg.id}
+                          roomId={roomId}
+                          currentUserUid={user.uid}
+                          isMe={isMe}
+                        />
                       </div>
                     )}
-                    {msg.text && <div className="break-words">{formatMessage(msg.text)} {msg.isEdited && <span className="text-[10px] opacity-70">(edited)</span>}</div>}
+
+                    {editingMessageId === msg.id ? (
+                      <div className="flex flex-col gap-2 min-w-[200px]">
+                        <textarea
+                          value={editText}
+                          onChange={(e) => setEditText(e.target.value)}
+                          className={`w-full p-2 rounded-lg text-sm bg-white/10 border border-white/20 text-white focus:outline-none focus:ring-1 focus:ring-white/40 resize-none ${!isMe && 'bg-slate-50 border-slate-200 text-slate-800'}`}
+                          rows={2}
+                          autoFocus
+                        />
+                        <div className="flex justify-end gap-2">
+                          <button onClick={cancelEditing} className="text-[10px] font-bold uppercase tracking-wider opacity-70 hover:opacity-100">Cancel</button>
+                          <button onClick={() => handleUpdateMessage(msg.id)} className="text-[10px] font-bold uppercase tracking-wider bg-white/20 px-2 py-1 rounded hover:bg-white/30">Save</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        {msg.text && <div className="break-words">{formatMessage(decryptText(msg.text))} {msg.isEdited && <span className="text-[10px] opacity-70 italic ml-1">(edited)</span>}</div>}
+                      </>
+                    )}
                     
                     {/* Reactions */}
                     {msg.reactions && Object.keys(msg.reactions).length > 0 && (
@@ -592,15 +754,6 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
                     </div>
                   </div>
                   
-                  {isMe && (
-                    <button 
-                      onClick={() => setMessageToDelete(msg.id)}
-                      className="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-all mb-1 flex-shrink-0"
-                      title="Delete message"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  )}
                 </div>
               </motion.div>
             );
@@ -610,6 +763,16 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
       </div>
 
       {/* Error Toast */}
+      <AnimatePresence>
+        {isVideoCallOpen && (
+          <VideoCallModal 
+            roomId={roomId} 
+            user={user} 
+            onClose={() => setIsVideoCallOpen(false)} 
+          />
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {error && (
           <motion.div 
@@ -706,6 +869,14 @@ export default function ChatRoom({ user, roomId, onLeave }: ChatRoomProps) {
               onChange={handleFileSelect} 
               className="hidden" 
             />
+            <button
+              type="button"
+              onClick={() => setIsOneTime(!isOneTime)}
+              className={`p-3 sm:p-4 transition-colors font-bold ${isOneTime ? 'text-red-500 bg-red-50' : 'text-slate-400 hover:text-slate-600'}`}
+              title="One-Time View"
+            >
+              {isOneTime ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+            </button>
             <input
               type="text"
               value={newMessage}
